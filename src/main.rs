@@ -16,7 +16,7 @@ extern crate sha2;
 use sha2::Sha256;
 use hmac::{Hmac, Mac};
 
-static NTHREADS: usize = 20;
+static NTHREADS: usize = 64;
 
 #[derive(Clone)]
 struct Jwt {
@@ -26,14 +26,11 @@ struct Jwt {
 }
 
 impl Jwt {
-    fn check(&self, key: &[u8]) -> Result<(), JwtError> {
-        let mut mac = Hmac::<Sha256>::new_varkey(key).unwrap();
-        mac.input(self.b64_signed_part.as_slice());
+    fn check(&self, key: Vec<u8>) -> Result<(), JwtError> {
+        let mut mac = Hmac::<Sha256>::new_varkey(&*key).unwrap();
+        mac.input(&*self.b64_signed_part);
 
-        let code = mac.result().code();
-        let computed_signature = code.as_slice();
-
-        if computed_signature.eq(self.signature.as_slice()) {
+        if &*mac.result().code() == &*self.signature {
             Ok(())
         } else {
             Err(JwtError::InvalidSignature)
@@ -119,7 +116,7 @@ fn main() {
 
     let mut length = 1;
 
-    let (key_tx, key_rx): (SyncSender<String>, Receiver<String>) = mpsc::sync_channel(NTHREADS*2);
+    let (key_tx, key_rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::sync_channel(NTHREADS*2);
     let mut children = Vec::with_capacity(NTHREADS);
     let (response_tx, response_rx): (Sender<String>, Receiver<String>) = mpsc::channel(); 
 
@@ -137,11 +134,10 @@ fn main() {
                 };
                 match recv {
                     Ok(current_string) => {
-                        //println!("testing {}", current_string);
-                        match jwt.check(current_string.as_bytes()) {
+                        let ref key = Box::new(current_string);
+                        match jwt.check(key.to_vec()) {
                             Ok(_) => {
-                                response_tx.send(current_string).unwrap();
-                                //println!("Key is {}", current_string);
+                                response_tx.send(String::from_utf8(key.to_vec()).unwrap()).unwrap();
                                 break;
                             },
                             Err(JwtError::InvalidSignature) => {},
@@ -166,10 +162,10 @@ fn main() {
         let nb_strs = alphabet_len.pow(length as u32);
 
         for i in 0..nb_strs {
-            let mut current_string = "".to_owned();
+            let mut current_string = vec![0; length];
             let mut quotient = i;
-            for _ in 0..length {
-                current_string.push(alphabet_chars[quotient % alphabet_len] as char);
+            for l in 0..length {
+                current_string[l] = alphabet_chars[quotient % alphabet_len];
                 quotient = quotient / alphabet_len;
             }
             key_tx.send(current_string).unwrap();
