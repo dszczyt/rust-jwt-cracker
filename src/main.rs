@@ -1,5 +1,9 @@
 use std::error::Error;
 use std::fmt;
+use std::sync::mpsc::{Sender, SyncSender, Receiver};
+use std::sync::mpsc;
+use std::thread;
+use std::sync::{Arc, Mutex};
 
 #[macro_use]
 extern crate clap;
@@ -12,26 +16,24 @@ extern crate sha2;
 use sha2::Sha256;
 use hmac::{Hmac, Mac};
 
-struct Jwt<'a> {
-    b64_signed_part: &'a [u8],
-    b64_signature: &'a [u8],
-    signature: &'a mut [u8],
+static NTHREADS: usize = 20;
+
+#[derive(Clone)]
+struct Jwt {
+    b64_signed_part: Vec<u8>,
+    b64_signature: Vec<u8>,
+    signature: Vec<u8>,
 }
 
-impl<'a> Jwt<'a> {
+impl Jwt {
     fn check(&self, key: &[u8]) -> Result<(), JwtError> {
         let mut mac = Hmac::<Sha256>::new_varkey(key).unwrap();
-        mac.input(self.b64_signed_part);
+        mac.input(self.b64_signed_part.as_slice());
 
         let code = mac.result().code();
         let computed_signature = code.as_slice();
 
-        // TODO: extract this outside of the loop
-        let b64_signature_vec = self.b64_signature.to_vec();
-        let decoded_signature = base64_url::decode(&b64_signature_vec).unwrap();
-        let signature = decoded_signature.as_slice();
-
-        if computed_signature.eq(signature) {
+        if computed_signature.eq(self.signature.as_slice()) {
             Ok(())
         } else {
             Err(JwtError::InvalidSignature)
@@ -40,19 +42,24 @@ impl<'a> Jwt<'a> {
 
     fn new() -> Self {
         Jwt{
-            b64_signed_part: &[],
-            b64_signature: &[],
-            signature: &mut [],
+            b64_signed_part: vec!(),
+            b64_signature: vec!(),
+            signature:vec!(),
         }
     }
 
-    fn split(&'a mut self, jwt_str: &'a String) -> Result<&'a Self, JwtError> {
+    fn split(mut self, jwt_str: String) -> Result<Self, JwtError> {
         let components: Vec<&str> = jwt_str.rsplitn(2, '.').collect();
         if components.len() != 2 {
             return Err(JwtError::InvalidFormat);
         }
-        self.b64_signed_part = components[1].as_bytes();
-        self.b64_signature = components[0].as_bytes();
+        self.b64_signed_part = components[1].to_owned().into_bytes();
+        self.b64_signature = components[0].to_owned().into_bytes();
+
+        // TODO: extract this outside of the loop
+        let b64_signature_vec = self.b64_signature.to_vec();
+        let decoded_signature = base64_url::decode(&b64_signature_vec).unwrap();
+        self.signature = decoded_signature;
 
         Ok(self)
     }
@@ -104,18 +111,56 @@ fn main() {
     )
     .get_matches();
 
-    let token = matches.value_of("token").unwrap().to_owned();
-
-    let mut jwt = Jwt::new();
-    let ref jwt = jwt.split(&token).unwrap();
+    let token = value_t!(matches, "token", String).unwrap();
+    let jwt = Jwt::new().split(token).unwrap();
     
 
-    let max_length: usize = value_t!(matches, "max_length", usize).unwrap();
+    let max_length = value_t!(matches, "max_length", usize).unwrap();
+
+    let mut length = 1;
+
+    let (key_tx, key_rx): (SyncSender<String>, Receiver<String>) = mpsc::sync_channel(NTHREADS*2);
+    let mut children = Vec::with_capacity(NTHREADS);
+    let (response_tx, response_rx): (Sender<String>, Receiver<String>) = mpsc::channel(); 
+
+    let multi_rx = Arc::new(Mutex::new(key_rx));
+
+    for _ in 0..NTHREADS {
+        let mutex_rx = multi_rx.clone();
+        let jwt = jwt.clone();
+        let response_tx = response_tx.clone();
+        let child = thread::spawn(move || {
+            loop {
+                let recv = {
+                    let key_rx = mutex_rx.lock().unwrap();
+                    key_rx.recv()
+                };
+                match recv {
+                    Ok(current_string) => {
+                        //println!("testing {}", current_string);
+                        match jwt.check(current_string.as_bytes()) {
+                            Ok(_) => {
+                                response_tx.send(current_string).unwrap();
+                                //println!("Key is {}", current_string);
+                                break;
+                            },
+                            Err(JwtError::InvalidSignature) => {},
+                            Err(err) => {
+                                eprintln!("ERROR: {}", err);
+                                break;
+                            },
+                        }
+                    },
+                    Err(_) => break
+                }
+            }
+        });
+        children.push(child);
+    }
+
     let alphabet = matches.value_of("alphabet").unwrap();
     let alphabet_len = alphabet.len();
     let alphabet_chars = alphabet.as_bytes();
-
-    let mut length = 1;
 
     'mainloop: while length <= max_length {
         let nb_strs = alphabet_len.pow(length as u32);
@@ -127,18 +172,17 @@ fn main() {
                 current_string.push(alphabet_chars[quotient % alphabet_len] as char);
                 quotient = quotient / alphabet_len;
             }
-            match jwt.check(current_string.as_bytes()) {
-                Ok(_) => {
-                    println!("Key is {}", current_string);
+            key_tx.send(current_string).unwrap();
+            let response = response_rx.try_recv();
+            match response {
+                Ok(response) => {
+                    println!("response is {}", response);
                     break 'mainloop;
                 },
-                Err(JwtError::InvalidSignature) => {},
-                Err(err) => {
-                    eprintln!("ERROR: {}", err);
-                    break 'mainloop;
-                },
+                _ => {}
             }
         }
         length += 1;
     }
+
 }
