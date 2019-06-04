@@ -1,0 +1,13 @@
+[package]
+name = "rust-jwt-cracker"
+version = "0.1.0"
+authors = ["Damien Szczyt <dszczyt@work4labs.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+base64-url = "1"
+clap = "2"
+hmac = "0.7"
+sha2 = "0.8"
