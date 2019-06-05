@@ -122,22 +122,22 @@ fn main() {
 
     let multi_rx = Arc::new(Mutex::new(key_rx));
 
-    for _ in 0..NTHREADS {
+    for thread_number in 0..NTHREADS {
         let mutex_rx = multi_rx.clone();
         let jwt = jwt.clone();
         let response_tx = response_tx.clone();
         let child = thread::spawn(move || {
             loop {
-                let recv = {
-                    let key_rx = mutex_rx.lock().unwrap();
-                    key_rx.recv()
-                };
-                match recv {
+                let x = mutex_rx.lock();
+                let z = x.unwrap();
+                match z.recv() {
                     Ok(current_string) => {
-                        let ref key = Box::new(current_string);
-                        match jwt.check(key.to_vec()) {
+                        let key = String::from_utf8(current_string.to_vec()).unwrap();
+                        //dbg!(key);
+                        println!("{} Starting {}", thread_number, key);
+                        match jwt.check(key.as_bytes().to_vec()) {
                             Ok(_) => {
-                                response_tx.send(String::from_utf8(key.to_vec()).unwrap()).unwrap();
+                                response_tx.send(key).unwrap();
                                 break;
                             },
                             Err(JwtError::InvalidSignature) => {},
@@ -146,6 +146,7 @@ fn main() {
                                 break;
                             },
                         }
+                        println!("{} Ending {}", thread_number, key);
                     },
                     Err(_) => break
                 }
@@ -160,25 +161,29 @@ fn main() {
 
     'mainloop: while length <= max_length {
         let nb_strs = alphabet_len.pow(length as u32);
+        let mut current_string = Box::new(vec![0; length]);
 
         for i in 0..nb_strs {
-            let mut current_string = vec![0; length];
             let mut quotient = i;
             for l in 0..length {
                 current_string[l] = alphabet_chars[quotient % alphabet_len];
                 quotient = quotient / alphabet_len;
             }
-            key_tx.send(current_string).unwrap();
+            key_tx.send(current_string.to_vec()).unwrap();
             let response = response_rx.try_recv();
             match response {
                 Ok(response) => {
-                    println!("response is {}", response);
+                    println!("Secret is \"{}\"", response);
                     break 'mainloop;
                 },
                 _ => {}
             }
         }
         length += 1;
+    }
+
+    for child in children {
+        child.join().unwrap();
     }
 
 }
