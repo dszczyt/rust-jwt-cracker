@@ -1,22 +1,14 @@
-use std::error::Error;
 use std::fmt;
-use std::sync::mpsc::{Sender, SyncSender, Receiver};
-use std::sync::mpsc;
-use std::thread;
-use std::sync::{Arc, Mutex};
+use std::{error::Error, process::exit};
 
-#[macro_use]
-extern crate clap;
-use clap::{Arg, App};
+use clap::Parser;
 
 extern crate base64_url;
 
-extern crate hmac;
-extern crate sha2;
-use sha2::Sha256;
 use hmac::{Hmac, Mac};
-
-static NTHREADS: usize = 64;
+use rust_jwt_cracker::AlphabetBaseGenerator;
+use sha2::Sha256;
+use tokio::{select, sync::mpsc};
 
 #[derive(Clone)]
 struct Jwt {
@@ -27,10 +19,12 @@ struct Jwt {
 
 impl Jwt {
     fn check(&self, key: Vec<u8>) -> Result<(), JwtError> {
-        let mut mac = Hmac::<Sha256>::new_varkey(&*key).unwrap();
-        mac.input(&*self.b64_signed_part);
+        let mut mac = Hmac::<Sha256>::new_from_slice(&key).unwrap();
+        mac.update(&*self.b64_signed_part);
 
-        if &*mac.result().code() == &*self.signature {
+        let result = mac.finalize();
+
+        if *result.into_bytes() == *self.signature {
             Ok(())
         } else {
             Err(JwtError::InvalidSignature)
@@ -38,10 +32,10 @@ impl Jwt {
     }
 
     fn new() -> Self {
-        Jwt{
-            b64_signed_part: vec!(),
-            b64_signature: vec!(),
-            signature:vec!(),
+        Jwt {
+            b64_signed_part: vec![],
+            b64_signature: vec![],
+            signature: vec![],
         }
     }
 
@@ -53,7 +47,6 @@ impl Jwt {
         self.b64_signed_part = components[1].to_owned().into_bytes();
         self.b64_signature = components[0].to_owned().into_bytes();
 
-        // TODO: extract this outside of the loop
         let b64_signature_vec = self.b64_signature.to_vec();
         let decoded_signature = base64_url::decode(&b64_signature_vec).unwrap();
         self.signature = decoded_signature;
@@ -77,113 +70,72 @@ impl fmt::Display for JwtError {
     }
 }
 
-impl Error for JwtError {
-    fn cause(&self) -> Option<&Error> {
-        match *self {
-            _ => None,
-        }
-    }
+impl Error for JwtError {}
+
+#[derive(Parser, Debug)]
+#[clap(author = "Damien Szczyt <damien.szczyt@gmail.com>")]
+#[clap(about = "Brute force jwt secret keys")]
+#[clap(version = "0.2")]
+pub struct Args {
+    #[clap(short = 'l', long, value_parser, default_value_t = 6)]
+    pub max_length: usize,
+
+    #[clap(long, value_parser)]
+    pub token: String,
+
+    #[clap(long, value_parser, default_value_t=String::from("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"))]
+    pub alphabet: String,
 }
 
-fn main() {
-    let matches = App::new("jwt-crack")
-    .version("0.1")
-    .author("Damien Szczyt <damien.szczyt@gmail.com>")
-    .about("Brute force jwt secret keys")
-    .arg(Arg::with_name("max_length")
-        .help("the maximum number of characters")
-        .short("l")
-        .default_value("6")
-        .takes_value(true)
-    )
-    .arg(Arg::with_name("token")
-        .help("the token")
-        .index(1)
-        .required(true)
-    )
-    .arg(Arg::with_name("alphabet")
-        .help("the alphabet to use")
-        .short("a")
-        .default_value("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-    )
-    .get_matches();
+#[tokio::main]
+async fn main() {
+    let args = Args::parse();
 
-    let token = value_t!(matches, "token", String).unwrap();
+    let token = args.token;
     let jwt = Jwt::new().split(token).unwrap();
-    
 
-    let max_length = value_t!(matches, "max_length", usize).unwrap();
+    let max_length = args.max_length;
 
-    let mut length = 1;
+    let alphabet = args.alphabet.clone();
 
-    let (key_tx, key_rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::sync_channel(NTHREADS*2);
-    let mut children = Vec::with_capacity(NTHREADS);
-    let (response_tx, response_rx): (Sender<String>, Receiver<String>) = mpsc::channel(); 
+    let (tx, mut rx) = mpsc::channel(10);
+    tokio::spawn(async move {
+        for (i, generated_string) in AlphabetBaseGenerator::init(alphabet.chars())
+            .with_limit(max_length)
+            .enumerate()
+        {
+            if i % 100000 == 99999 {
+                dbg!(&generated_string);
+            }
+            tx.send(generated_string).await.unwrap();
+        }
+    });
 
-    let multi_rx = Arc::new(Mutex::new(key_rx));
+    let (done_tx, mut done_rx) = mpsc::channel(1);
 
-    for thread_number in 0..NTHREADS {
-        let mutex_rx = multi_rx.clone();
-        let jwt = jwt.clone();
-        let response_tx = response_tx.clone();
-        let child = thread::spawn(move || {
-            loop {
-                let x = mutex_rx.lock();
-                let z = x.unwrap();
-                match z.recv() {
-                    Ok(current_string) => {
-                        let key = String::from_utf8(current_string.to_vec()).unwrap();
-                        //dbg!(key);
-                        println!("{} Starting {}", thread_number, key);
-                        match jwt.check(key.as_bytes().to_vec()) {
-                            Ok(_) => {
-                                response_tx.send(key).unwrap();
-                                break;
-                            },
-                            Err(JwtError::InvalidSignature) => {},
-                            Err(err) => {
-                                eprintln!("ERROR: {}", err);
-                                break;
-                            },
+    loop {
+        select! {
+            key = rx.recv() => {
+                let key = key.unwrap();
+                let done_tx = done_tx.clone();
+                let jwt = jwt.clone();
+                tokio::spawn(async move {
+                    match jwt.check(key.as_bytes().to_vec()) {
+                        Ok(_) => {
+                            println!("Key is {}", key);
+                            done_tx.send(()).await.unwrap();
                         }
-                        println!("{} Ending {}", thread_number, key);
-                    },
-                    Err(_) => break
-                }
-            }
-        });
-        children.push(child);
-    }
-
-    let alphabet = matches.value_of("alphabet").unwrap();
-    let alphabet_len = alphabet.len();
-    let alphabet_chars = alphabet.as_bytes();
-
-    'mainloop: while length <= max_length {
-        let nb_strs = alphabet_len.pow(length as u32);
-        let mut current_string = Box::new(vec![0; length]);
-
-        for i in 0..nb_strs {
-            let mut quotient = i;
-            for l in 0..length {
-                current_string[l] = alphabet_chars[quotient % alphabet_len];
-                quotient = quotient / alphabet_len;
-            }
-            key_tx.send(current_string.to_vec()).unwrap();
-            let response = response_rx.try_recv();
-            match response {
-                Ok(response) => {
-                    println!("Secret is \"{}\"", response);
-                    break 'mainloop;
-                },
-                _ => {}
+                        Err(JwtError::InvalidSignature) => {}
+                        Err(err) => {
+                            eprintln!("ERROR: {}", err);
+                            done_tx.send(()).await.unwrap();
+                        }
+                    }
+                });
+            },
+            _ = done_rx.recv() => {
+                exit(0);
             }
         }
-        length += 1;
     }
-
-    for child in children {
-        child.join().unwrap();
-    }
-
 }

@@ -1,6 +1,6 @@
 [package]
 name = "rust-jwt-cracker"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Damien Szczyt <dszczyt@work4labs.com>"]
 edition = "2018"
 
@@ -12,6 +12,7 @@ lto = true
 
 [dependencies]
 base64-url = "1"
-clap = "2"
-hmac = "0.7"
-sha2 = "0.8"
+clap = { version = "3", features = ["derive"] }
+hmac = "0.12"
+sha2 = "0.10"
+tokio = { version = "1.20", features = ["full"] }
